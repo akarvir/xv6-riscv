@@ -102,6 +102,29 @@ allocpid()
   return pid;
 }
 
+// Account for the state being left. The caller holds p->lock.
+static void
+setstate(struct proc *p, enum procstate next)
+{
+  uint64 now = r_time();
+  uint64 elapsed = now - p->state_since;
+
+  switch (p->state) {
+  case RUNNING:  p->stats.running += elapsed; break;
+  case RUNNABLE: p->stats.runnable += elapsed; break;
+  case SLEEPING: p->stats.sleeping += elapsed; break;
+  default: break;
+  }
+  if (next == RUNNING && !p->has_run) {
+    p->stats.response = now - p->created;
+    p->has_run = 1;
+  }
+  if (next == ZOMBIE)
+    p->stats.turnaround = now - p->created;
+  p->state_since = now;
+  p->state = next;
+}
+
 // Look in the process table for an UNUSED proc.
 // If found, initialize state required to run in the kernel,
 // and return with p->lock held.
@@ -124,6 +147,9 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
+  p->created = p->state_since = r_time();
+  p->has_run = 0;
+  memset(&p->stats, 0, sizeof(p->stats));
 
   // Allocate a trapframe page.
   if ((p->trapframe = (struct trapframe *)kalloc()) == 0) {
@@ -225,7 +251,7 @@ userinit(void)
 
   p->cwd = namei("/");
 
-  p->state = RUNNABLE;
+  setstate(p, RUNNABLE);
 
   release(&p->lock);
 }
@@ -298,7 +324,7 @@ kfork(void)
   release(&wait_lock);
 
   acquire(&np->lock);
-  np->state = RUNNABLE;
+  setstate(np, RUNNABLE);
   release(&np->lock);
 
   return pid;
@@ -355,7 +381,7 @@ kexit(int status)
   acquire(&p->lock);
 
   p->xstate = status;
-  p->state = ZOMBIE;
+  setstate(p, ZOMBIE);
 
   release(&wait_lock);
 
@@ -367,7 +393,7 @@ kexit(int status)
 // Wait for a child process to exit and return its pid.
 // Return -1 if this process has no children.
 int
-kwait(uint64 addr)
+kwait(uint64 addr, uint64 statsaddr)
 {
   struct proc *pp;
   int havekids, pid;
@@ -390,6 +416,13 @@ kwait(uint64 addr)
           if (addr != 0 &&
               copyout(p->pagetable, p->sz, addr, (char *)&pp->xstate,
                       sizeof(pp->xstate)) < 0) {
+            release(&pp->lock);
+            release(&wait_lock);
+            return -1;
+          }
+          if (statsaddr != 0 &&
+              copyout(p->pagetable, p->sz, statsaddr, (char *)&pp->stats,
+                      sizeof(pp->stats)) < 0) {
             release(&pp->lock);
             release(&wait_lock);
             return -1;
@@ -448,7 +481,7 @@ scheduler(void)
         // Switch to chosen process.  It is the process's job
         // to release its lock and then reacquire it
         // before jumping back to us.
-        p->state = RUNNING;
+        setstate(p, RUNNING);
         c->proc = p;
         swtch(&c->context, &p->context);
 
@@ -502,7 +535,7 @@ yield(void)
 {
   struct proc *p = myproc();
   acquire(&p->lock);
-  p->state = RUNNABLE;
+  setstate(p, RUNNABLE);
   sched();
   release(&p->lock);
 }
@@ -565,7 +598,7 @@ sleep(void)
 
   acquire(&p->lock);
   if (p->chan != 0) {
-    p->state = SLEEPING;
+    setstate(p, SLEEPING);
     sched();
   }
   release(&p->lock);
@@ -585,9 +618,9 @@ wakeup(void *chan)
       p->chan = 0;
 
       // If this waiting process has gotten so far as to actually
-      // go to sleep, also set it back to RUNNING.
+      // go to sleep, also set it back to RUNNABLE.
       if (p->state == SLEEPING) {
-        p->state = RUNNABLE;
+        setstate(p, RUNNABLE);
       }
     }
     release(&p->lock);
@@ -611,7 +644,7 @@ kkill(int pid)
       p->killed = 1;
       if (p->state == SLEEPING) {
         // Wake process from sleep().
-        p->state = RUNNABLE;
+        setstate(p, RUNNABLE);
       }
       release(&p->lock);
       return 0;

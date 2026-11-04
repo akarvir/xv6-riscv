@@ -1,3 +1,5 @@
+#include "procstats.h"
+
 // Saved registers for kernel context switches.
 struct context {
   uint64 ra;
@@ -83,6 +85,10 @@ struct proc {
   struct spinlock lock;
 
   // p->lock must be held when using these:
+  uint64 created;         // Time at allocation
+  uint64 state_since;     // Time of the last state change
+  int has_run;            // First dispatch has been recorded
+  struct procstats stats;
   enum procstate state; // Process state
   void *chan;           // If non-zero, sleeping on chan
   int killed;           // If non-zero, have been killed
